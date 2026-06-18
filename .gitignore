@@ -1,0 +1,40 @@
+# ─── Virtual Environment ─────────────────────────────────────────────────────
+env/
+venv/
+.env/
+.venv/
+ENV/
+environment/
+
+# ─── Environment Variables / Secrets ─────────────────────────────────────────
+.env
+*.env
+.env.*
+
+# ─── Project-specific exclusions ─────────────────────────────────────────────
+GeM-PDF/
+RFQ_Pipeline_Stage1_Stage2.md
+
+# ─── Python Artifacts ────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+
+# ─── Build / Dist ────────────────────────────────────────────────────────────
+dist/
+build/
+*.egg-info/
+*.egg
+
+# ─── Output / Generated Files ────────────────────────────────────────────────
+output/
+
+# ─── OS & Editor ─────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
