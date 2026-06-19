@@ -127,17 +127,21 @@ def parse(text: str) -> list[dict]:
             mfg_list, mpn_list = [], []
             while i + 1 < len(bid_lines):
                 nxt = bid_lines[i + 1]
+                # Stop if we hit the next numbered item line
                 if re.match(r"^\d+\s+\d{8,}", nxt):
                     break
-                if "-" not in nxt and "/" not in nxt:
+                # Split on the FIRST '-' that separates MFG name from part number.
+                # MFG names may contain '/' (e.g. EA/SPL) so we only require a '-'.
+                dash_idx = nxt.find("-")
+                if dash_idx == -1:
+                    # No dash at all — not a supplier line, stop consuming
                     break
-                nxt_n   = re.sub(r",\s*-", "-", nxt)
-                split_m = re.match(r"^(.*?[A-Z\)\/\.])\\s*-\\s*(.+)$", nxt_n)
-                if split_m:
-                    mfg_list.append(split_m.group(1).strip().rstrip(",/").strip())
-                    mpn_list.append(split_m.group(2).strip())
-                else:
+                mfg_raw = nxt[:dash_idx].strip().rstrip(",")
+                mpn_raw = nxt[dash_idx + 1:].strip()
+                if not mfg_raw:
                     break
+                mfg_list.append(mfg_raw)
+                mpn_list.append(mpn_raw)
                 i += 1
 
             rows.append({
@@ -151,8 +155,8 @@ def parse(text: str) -> list[dict]:
                 "SN":                      sn,
                 "CPN":                     cpn,
                 "Description":             desc,
-                "Enq. Part No*":           " // ".join(mpn_list) if mpn_list else "NA",
-                "Enq. Mfg":                " // ".join(mfg_list) if mfg_list else "NA",
+                "Enq. Part No*":           "//".join(mpn_list) if mpn_list else "NA",
+                "Enq. Mfg":                "//".join(mfg_list) if mfg_list else "NA",
                 "Qty":                     qty,
                 "Unit":                    unit,
                 "ITEM/VALUE.(EVALUATION)": item_value,

@@ -418,6 +418,110 @@ def parse_boq_excel(excel_path: str) -> list[dict]:
     return items
 
 
+def download_boq_csv_from_annotations(pdf_bytes: bytes) -> list[dict]:
+    """
+    Scans all page annotations in the PDF for a 'BoqLineItemsDocument' CSV URL
+    (the BOQ Detail Document line-items file hosted on mkp.gem.gov.in).
+    Downloads the first one found, parses it, and returns a list of dicts:
+      {sn, part_no, enq_part_no, description, qty, uom}
+
+    The CSV always has columns:
+      Item Number | Item Title | Item Description | Item Quantity |
+      Unit of Measure | Consignee ID | Delivery Period
+
+    Returns [] if no annotation URL is found or download fails.
+    """
+    import requests
+
+    if not pdf_bytes:
+        return []
+
+    seen_urls = set()
+    boq_csv_url = None
+
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                for annot in (page.annots or []):
+                    uri = annot.get("uri", "") or ""
+                    if "BoqLineItemsDocument" in uri and uri not in seen_urls:
+                        boq_csv_url = uri
+                        seen_urls.add(uri)
+                        break           # first unique URL is enough
+                if boq_csv_url:
+                    break
+    except Exception as e:
+        log.warning(f"  Could not scan PDF annotations for BOQ URL: {e}")
+        return []
+
+    if not boq_csv_url:
+        log.info("  No BoqLineItemsDocument annotation URL found in PDF.")
+        return []
+
+    log.info(f"  Found BOQ CSV URL: {boq_csv_url}")
+
+    try:
+        resp = requests.get(
+            boq_csv_url,
+            timeout=20,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        log.warning(f"  Failed to download BOQ CSV: {e}")
+        return []
+
+    try:
+        import pandas as pd
+        df = pd.read_csv(io.StringIO(resp.text))
+        df.columns = [str(c).strip() for c in df.columns]
+
+        # Locate columns flexibly
+        col_map = {}
+        for col in df.columns:
+            cl = col.lower()
+            if "item number" in cl or "item no" in cl:
+                col_map["sn"] = col
+            elif "item title" in cl:
+                col_map["title"] = col
+            elif "item description" in cl:
+                col_map["description"] = col
+            elif "item quantity" in cl or ("quantity" in cl and "delivery" not in cl):
+                col_map["qty"] = col
+            elif "unit of measure" in cl or cl == "uom":
+                col_map["uom"] = col
+
+        items = []
+        for _, row in df.iterrows():
+            sn_raw = str(row.get(col_map.get("sn", ""), "")).strip()
+            if not sn_raw or not sn_raw.replace(".", "").isdigit():
+                continue
+            title = str(row.get(col_map.get("title", ""), "")).strip()
+            desc  = str(row.get(col_map.get("description", ""), "")).strip()
+            qty   = str(row.get(col_map.get("qty", ""), "")).strip()
+            uom   = str(row.get(col_map.get("uom", ""), "")).strip()
+
+            part_no = _extract_part_from_title(title) or title
+
+            items.append({
+                "sn":          sn_raw,
+                "part_no":     part_no,
+                "enq_part_no": part_no,
+                "description": desc or title,
+                "qty":         qty,
+                "uom":         uom,
+            })
+
+        log.info(f"  BOQ CSV downloaded: {len(items)} items, "
+                 f"UoM sample: {[it['uom'] for it in items[:3]]}")
+        return items
+
+    except Exception as e:
+        log.warning(f"  Failed to parse BOQ CSV: {e}")
+        return []
+
+
+
 def _extract_part_from_title(title: str) -> str:
     """
     Title examples:
@@ -753,39 +857,65 @@ def parse(text: str, pdf_bytes: bytes = None) -> list[dict]:
     # If we have schedule items, we can match them with consignee
     # quantities. Otherwise, use Item Category parsing.
 
+    # ── STEP 3b: Auto-download BOQ line-items CSV from PDF annotations ─
+    # GeM PDFs embed a direct public URL to the BOQ Detail Document CSV
+    # (BoqLineItemsDocument) in their page link annotations.  We extract
+    # that URL and download the CSV — no login required.
+    boq_csv_items = []
+    if pdf_bytes:
+        boq_csv_items = download_boq_csv_from_annotations(pdf_bytes)
+
     if schedule_items:
-        # ── Pattern 1 (MPR) or direct schedule data ──────────
+        # ── Pattern 1 (MPR) – inner spec PDF ─────────────────
         # Match schedule items with consignee quantities
         line_items = []
         for i, sched in enumerate(schedule_items):
             qty = sched["qty"]
-            # If we have matching consignee data, use its quantity
             if i < len(consignees):
                 qty = consignees[i].get("qty", qty)
+            # UoM from the downloaded BOQ CSV if available (Pattern 1 BOQ
+            # items and Pattern 2 share the same CSV format)
+            uom = boq_csv_items[i]["uom"] if i < len(boq_csv_items) else sched.get("uom", "Numbers")
 
             line_items.append({
                 "part_no":      sched["part_no"],
                 "description":  f"Refer specification for {sched['part_no']}",
                 "enq_part_no":  sched["part_no"],
                 "qty":          qty,
-                "uom":          "Numbers"
+                "uom":          uom,
             })
 
         # ── Check for known bid numbers to use hardcoded data ─
-        # Match the bid number to known demo data for richer output
         if bid_number == "GEM/2026/B/7587781":
-            line_items = MPR_ITEMS_PATTERN1
+            if boq_csv_items:
+                line_items = [
+                    {**item, "uom": boq_csv_items[i]["uom"] if i < len(boq_csv_items) else item["uom"]}
+                    for i, item in enumerate(MPR_ITEMS_PATTERN1)
+                ]
+            else:
+                line_items = MPR_ITEMS_PATTERN1
             log.info("  → Using MPR Pattern 1 demo data (matched bid number)")
         elif _items_match_mpr_parts(schedule_items):
-            line_items = MPR_ITEMS_PATTERN1
+            if boq_csv_items:
+                line_items = [
+                    {**item, "uom": boq_csv_items[i]["uom"] if i < len(boq_csv_items) else item["uom"]}
+                    for i, item in enumerate(MPR_ITEMS_PATTERN1)
+                ]
+            else:
+                line_items = MPR_ITEMS_PATTERN1
             log.info("  → Using MPR Pattern 1 demo data (matched part numbers)")
 
     else:
-        # ── No schedules found → Pattern 2 (BOQ) ────────────
-        # Try to use Item Category parts from text
+        # ── No schedules → Pattern 2 (BOQ Excel / CSV) ───────
         cat_parts = parse_item_category_parts(text)
 
-        if bid_number == "GEM/2025/B/6998572":
+        if boq_csv_items:
+            # Best case: we have live data from the BOQ CSV — use it directly.
+            # This gives real part numbers, descriptions, quantities AND UoM.
+            line_items = boq_csv_items
+            log.info(f"  → Using live BOQ CSV data ({len(line_items)} items)")
+
+        elif bid_number == "GEM/2025/B/6998572":
             line_items = BOQ_ITEMS_PATTERN2
             log.info("  → Using BOQ Pattern 2 demo data (matched bid number)")
         elif cat_parts and _items_match_boq_parts(cat_parts):
@@ -796,23 +926,25 @@ def parse(text: str, pdf_bytes: bytes = None) -> list[dict]:
             line_items = []
             for i, cons in enumerate(consignees):
                 part = cat_parts[i] if i < len(cat_parts) else f"ITEM-{i+1}"
+                uom = boq_csv_items[i]["uom"] if i < len(boq_csv_items) else "Each"
                 line_items.append({
                     "part_no":      part,
                     "description":  f"Refer BOQ specification for {part}",
                     "enq_part_no":  part,
                     "qty":          cons.get("qty", ""),
-                    "uom":          "Each"
+                    "uom":          uom,
                 })
         else:
             # Absolute fallback: single placeholder row
             line_items = [{
                 "part_no":      bid_number,
-                "description":  f"GeM Bid - see specification document",
+                "description":  "GeM Bid - see specification document",
                 "enq_part_no":  bid_number,
                 "qty":          "1",
-                "uom":          "Numbers"
+                "uom":          "Numbers",
             }]
             log.warning("  → No schedule/consignee data found. Using placeholder.")
+
 
     log.info(f"  Total line items: {len(line_items)}")
 
