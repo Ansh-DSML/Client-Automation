@@ -191,24 +191,39 @@ def _extract_part_no_from_category(category_text: str) -> str:
     """
     Extract the HAL/GeM part number from an Item Category string.
 
-    Patterns observed:
-      '33505964011, 80 PIN MODULE FLANGE PLUG'  → 33505964011
-      '51107159 Crystal Oscillator 36.864 Mhz'  → 51107159
-      '51126961-Circular Connector, C Size...'  → 51126961
-      '68838104 Copper Braid HAL-6176...'        → 68838104
-
-    Strategy: grab the leading digit-only token (may include a trailing hyphen
-    that separates the PN from the description).
+    Patterns handled (tested across 6 PDFs):
+      '68756716 - Self Solder Sleeve...'   → 68756716      (digits then ' - ')
+      '51126961-circular Connector...'     → 51126961      (digits then '-word')
+      '51107159 Crystal Oscillator...'     → 51107159      (digits then space+word)
+      '51106932 - CONNECTOR 530721-3...'   → 51106932      (digits then ' - ')
+      'Connector, 33505964011, 80 Pin...'  → 33505964011   (word first, digits later)
+      '901316P51S, SMA STR PLUG'           → 901316P51S    (alphanumeric mixed)
     """
-    # Strip leading/trailing whitespace
-    text = category_text.strip()
+    # Normalise whitespace — pdfplumber puts \n in multi-line cells
+    text = re.sub(r'\s+', ' ', category_text).strip()
 
-    # Match a leading numeric block (digits only, no letters)
-    m = re.match(r'^(\d+)', text)
+    # Case A: starts with digits+letters ending at comma or ' - '
+    # Handles: "901316P51S, SMA STR PLUG", "68756716 - Self Solder...", "51106932 - CONNECTOR..."
+    m = re.match(r'^(\d[\w]*?)(?:\s*,|\s+-\s)', text)
     if m:
         return m.group(1).strip()
 
-    # Fallback: return the whole string if no numeric prefix found
+    # Case B: starts with pure digits then hyphen (e.g. "51126961-circular")
+    m = re.match(r'^(\d+)-', text)
+    if m:
+        return m.group(1).strip()
+
+    # Case C: starts with pure digits then space (e.g. "51107159 Crystal...")
+    m = re.match(r'^(\d+)\s', text)
+    if m:
+        return m.group(1).strip()
+
+    # Case D: digits appear after a word (e.g. "Connector, 33505964011, ...")
+    m = re.search(r'(?<![A-Za-z\-])(\d{6,})', text)
+    if m:
+        return m.group(1).strip()
+
+    # Fallback — should not reach here for GeM PDFs
     return text.upper()
 
 
@@ -285,15 +300,15 @@ def parse_schedules_from_tables(pdf_bytes: bytes) -> list[dict]:
                             col1 = str(row[1] or "").strip().replace(",", "")
                             if re.match(r'^\d+(\.\d+)?$', col1):
                                 # 4-col layout: col[2]=description, col[3]=qty
-                                description = str(row[2] or "").strip()
+                                description = re.sub(r'\s+', ' ', str(row[2] or "")).strip()
                                 qty = str(row[3] or "").strip()
                             else:
                                 # 4-col but col[1] is actually description
-                                description = str(row[1] or "").strip()
+                                description = re.sub(r'\s+', ' ', str(row[1] or "")).strip()
                                 qty = str(row[-1] or "").strip()
                         elif ncols == 3:
                             # 3-col layout: col[1]=description, col[2]=qty
-                            description = str(row[1] or "").strip()
+                            description = re.sub(r'\s+', ' ', str(row[1] or "")).strip()
                             qty = str(row[2] or "").strip()
                         else:
                             continue
@@ -365,6 +380,52 @@ def parse_item_category_parts(text: str) -> list[str]:
             if token and len(token) >= 3 and not token.startswith('(cid:'):
                 parts.append(token.upper())
     return parts
+
+
+def parse_single_item_from_text(text: str, pdf_bytes: bytes = None) -> list[dict]:
+    """
+    Fallback for single-item bids that have NO Evaluation Schedules table.
+
+    In these bids the item lives in the 'Item Category' field on page 1,
+    and the quantity lives in the consignee table (col[3]).
+
+    Returns a list with one dict, or [] if nothing can be extracted.
+    """
+    # Extract Item Category from text
+    m = re.search(r'/Item Category\s+(.+?)(?:\n|GeMARPTS)', text, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return []
+
+    item_cat = re.sub(r'\s+', ' ', m.group(1)).strip()
+    if not item_cat:
+        return []
+
+    part_no = _extract_part_no_from_category(item_cat)
+
+    # Extract quantity from the consignee table (col[3], the row with '***' in col[2])
+    qty = "1"
+    if pdf_bytes:
+        try:
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                for page in pdf.pages:
+                    for table in (page.extract_tables() or []):
+                        if not table:
+                            continue
+                        for row in table:
+                            if row and len(row) >= 4 and "***" in str(row[2] or ""):
+                                q = str(row[3] or "").strip()
+                                if q.isdigit():
+                                    qty = q
+                                    break
+        except Exception as e:
+            log.warning(f"Single item qty extraction failed: {e}")
+
+    return [{
+        "schedule_no": 1,
+        "part_no":     part_no,
+        "description": item_cat,
+        "qty":         qty,
+    }]
 
 
 def determine_customer_remarks(customer: str) -> str:
@@ -480,10 +541,15 @@ def parse(text: str, pdf_bytes: bytes = None) -> list[dict]:
         schedule_items = parse_schedules_from_tables(pdf_bytes)
         log.info(f"  Schedules (from tables): {len(schedule_items)} items")
 
-    # Fallback: text-based extraction (keep as secondary fallback)
+    # Fallback 1: text-based schedule regex
     if not schedule_items:
         schedule_items = parse_schedules_from_text(text)
         log.info(f"  Schedules (from text): {len(schedule_items)} items")
+
+    # Fallback 2: single-item bid — extract from Item Category field
+    if not schedule_items:
+        schedule_items = parse_single_item_from_text(text, pdf_bytes)
+        log.info(f"  Schedules (single item fallback): {len(schedule_items)} items")
 
     # ── STEP 3: Extract per-schedule delivery days ────────────────
     delivery_days_list = []
